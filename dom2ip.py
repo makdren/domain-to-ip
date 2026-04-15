@@ -6,6 +6,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from urllib.parse import urlparse
 
 
 RESET = "\033[0m"
@@ -37,8 +38,62 @@ def print_banner() -> None:
     print(banner)
 
 
-def load_domains(file_path: Path) -> List[str]:
-    """Загружает домены из файла с поддержкой всех форматов"""
+def normalize_domain(raw_domain: str) -> Optional[str]:
+    """
+    Приводит входную строку к доменному имени:
+    - поддерживает URL (https://example.com/path)
+    - убирает порт (:443), путь, query/fragment
+    - поддерживает IDN через punycode
+    Возвращает None, если домен невалидный.
+    """
+    value = raw_domain.strip()
+    if not value:
+        return None
+
+    # Если строка похожа на URL — парсим корректно.
+    if "://" in value:
+        parsed = urlparse(value)
+        value = parsed.hostname or ""
+    else:
+        # На случай записей вида "example.com/path" или "example.com:443"
+        value = value.split("/")[0].split("?")[0].split("#")[0]
+        if ":" in value:
+            value = value.split(":", 1)[0]
+
+    value = value.strip().strip(".").lower()
+    if not value:
+        return None
+
+    # Удаляем недопустимые символы, которые могут попасть из текста/CSV.
+    value = value.strip("\"'`()[]{}<>")
+    if not value:
+        return None
+
+    try:
+        # Нормализуем IDN в ascii-представление.
+        ascii_domain = value.encode("idna").decode("ascii")
+    except Exception:
+        return None
+
+    # Базовая проверка формата доменного имени.
+    if "." not in ascii_domain:
+        return None
+
+    labels = ascii_domain.split(".")
+    for label in labels:
+        if not label or len(label) > 63:
+            return None
+        if label.startswith("-") or label.endswith("-"):
+            return None
+
+    if len(ascii_domain) > 253:
+        return None
+
+    return ascii_domain
+
+
+def load_domains(file_path: Path) -> Tuple[List[str], List[str]]:
+    """Загружает и нормализует домены из файла."""
     if not file_path.exists():
         print(f"{RED}❌ Файл {file_path.name} не найден!{RESET}")
         print(f"   Создайте {file_path.name} и добавьте домены.")
@@ -48,23 +103,39 @@ def load_domains(file_path: Path) -> List[str]:
         content = f.read()
 
     raw_domains = [d.strip() for d in content.replace(",", " ").split() if d.strip()]
+    normalized_domains: List[str] = []
+    skipped_raw: List[str] = []
+
+    for raw_domain in raw_domains:
+        normalized = normalize_domain(raw_domain)
+        if normalized:
+            normalized_domains.append(normalized)
+        else:
+            skipped_raw.append(raw_domain)
 
     # Удаляем дубликаты, сохраняя порядок появления
-    domains = list(dict.fromkeys(raw_domains))
+    domains = list(dict.fromkeys(normalized_domains))
 
     if not domains:
         print(f"{RED}❌ В файле {file_path.name} нет доменов.{RESET}")
         sys.exit(1)
 
-    return domains
+    return domains, skipped_raw
 
 
-def resolve_domain(domain: str) -> Tuple[str, Optional[str], Optional[str]]:
-    try:
-        ip = socket.gethostbyname(domain)
-        return domain, ip, None
-    except Exception as e:
-        return domain, None, str(e)
+def resolve_domain(domain: str, retries: int = 1, retry_delay: float = 0.25) -> Tuple[str, Optional[str], Optional[str]]:
+    last_error = None
+    attempts = max(retries, 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            ip = socket.gethostbyname(domain)
+            return domain, ip, None
+        except Exception as e:
+            last_error = str(e)
+            if attempt < attempts:
+                time.sleep(retry_delay)
+
+    return domain, None, last_error
 
 
 def delete_old_files() -> None:
@@ -120,6 +191,18 @@ def parse_arguments() -> argparse.Namespace:
         default=DOMAINS_FILE,
         help="Путь к файлу с доменами (по умолчанию: domains.txt)"
     )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="Количество попыток DNS-резолва для каждого домена (по умолчанию: 2)"
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=0.25,
+        help="Пауза между повторными попытками в секундах (по умолчанию: 0.25)"
+    )
     return parser.parse_args()
 
 
@@ -132,9 +215,11 @@ def main() -> None:
     # Устанавливаем таймаут
     socket.setdefaulttimeout(args.timeout)
 
-    domains = load_domains(args.domains)
+    domains, skipped_raw = load_domains(args.domains)
 
     print(f"{GREEN}✅ Найдено {len(domains)} уникальных доменов.{RESET}")
+    if skipped_raw:
+        print(f"{YELLOW}⚠️  Пропущено невалидных записей: {len(skipped_raw)}{RESET}")
     print(f"{BLUE}   Запускаем параллельное разрешение ({args.threads} потоков)...{RESET}\n")
 
     resolved: Dict[str, str] = {}
@@ -143,7 +228,10 @@ def main() -> None:
     total = len(domains)
 
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        future_to_domain = {executor.submit(resolve_domain, d): d for d in domains}
+        future_to_domain = {
+            executor.submit(resolve_domain, d, args.retries, args.retry_delay): d
+            for d in domains
+        }
 
         for future in as_completed(future_to_domain):
             domain, ip, error = future.result()
@@ -168,6 +256,10 @@ def main() -> None:
         print(f"{YELLOW}⚠️  Не удалось обработать {len(failed)} доменов:{RESET}")
         for d, err in failed:
             print(f"   • {d} → {RED}{err}{RESET}")
+    if skipped_raw:
+        print(f"{YELLOW}⚠️  Пропущенные записи (невалидный формат):{RESET}")
+        for raw in skipped_raw:
+            print(f"   • {raw}")
 
     # Удаляем старые файлы и создаём новые
     delete_old_files()
